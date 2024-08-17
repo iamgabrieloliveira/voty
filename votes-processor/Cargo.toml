@@ -1,0 +1,7 @@
+[package]
+name = "votes-processor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+queue-client = { version = "0.1.0", path = "../queue-client" }
