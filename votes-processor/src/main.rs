@@ -1,22 +1,68 @@
-use queue_client::Queue;
-use std::io::Read;
+use queue_client::{QueueClient, Subscriber};
+use serde::Deserialize;
+use sqlx::{postgres::PgConnectOptions, PgPool};
+use std::sync::Arc;
 
-fn main() {
-    let mut queue = Queue::new("127.0.0.1:8082").unwrap();
+#[derive(Deserialize, Debug)]
+struct Config {
+    db_name: String,
+    db_host: String,
+    db_port: u16,
+    db_user: String,
+    db_password: String,
+    queue_host: String,
+    queue_port: u16,
+}
 
-    queue.subscribe();
+#[derive(Deserialize, Debug)]
+struct VotePayload {
+    voter_id: String,
+    votee_id: String,
+}
 
-    loop {
-        let mut message = vec![0; 1024];
-        let bytes_read = queue.connection.read(&mut message).unwrap();
+async fn subscribe_in_queue(config: &Config) -> Result<Subscriber, String> {
+    let queue_addr = format!("{}:{}", config.queue_host, config.queue_port);
 
-        if bytes_read == 0 {
-            println!("Connection closed");
-            break;
-        }
+    QueueClient::subscribe(&queue_addr)
+        .await
+        .map_err(|e| format!("Failed to connect to queue: {}", e))
+}
 
-        let message = std::str::from_utf8(&message[..bytes_read]).unwrap();
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
 
-        println!("Received: {:?}", message);
+    let config = envy::from_env::<Config>()?;
+
+    let db_config = PgConnectOptions::new()
+        .host(&config.db_host)
+        .port(config.db_port)
+        .username(&config.db_user)
+        .password(&config.db_password)
+        .database(&config.db_name);
+
+    let db = Arc::new(PgPool::connect_with(db_config).await?);
+
+    let mut subscriber = subscribe_in_queue(&config).await?;
+
+    log::info!("Starting to listen for votes");
+
+    while let Ok(message) = subscriber.listen().await {
+        let db = Arc::clone(&db);
+
+        let payload = serde_json::from_slice::<VotePayload>(&message).unwrap();
+
+        log::debug!("Received vote: {:?}", payload);
+
+        let uuid = sqlx::types::Uuid::new_v4();
+
+        sqlx::query("INSERT INTO votes (id, voter_id, votee_id) VALUES ($1, $2, $3)")
+            .bind(&uuid)
+            .bind(&payload.voter_id)
+            .bind(&payload.votee_id)
+            .execute(&*db)
+            .await?;
     }
+
+    Ok(())
 }

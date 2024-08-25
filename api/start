@@ -1,0 +1,9 @@
+#!/bin/bash
+
+export RUST_LOG=debug
+export API_HOST=localhost
+export API_PORT=8080
+export QUEUE_HOST=localhost
+export QUEUE_PORT=6432
+
+cargo run

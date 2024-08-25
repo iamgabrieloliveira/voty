@@ -1,0 +1,12 @@
+#!/bin/bash
+
+export RUST_LOG=debug
+export DB_NAME=postgres
+export DB_HOST=localhost
+export DB_PORT=5432
+export DB_USER=postgres
+export DB_PASSWORD=root
+export QUEUE_HOST=localhost
+export QUEUE_PORT=6432
+
+cargo run

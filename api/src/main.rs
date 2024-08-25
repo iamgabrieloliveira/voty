@@ -1,25 +1,21 @@
-use queue_client::Queue;
+use queue_client::Publisher;
+use queue_client::QueueClient;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use actix_web::{post, web, App, HttpResponse, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
 
-type SharedQueue = Arc<Mutex<Queue>>;
+#[derive(Debug, Deserialize)]
+struct Config {
+    api_host: String,
+    api_port: u16,
+    queue_host: String,
+    queue_port: u16,
+}
 
 struct AppState {
-    queue: SharedQueue,
-}
-
-fn create_app_state() -> AppState {
-    let queue = create_queue("127.0.0.1:8080");
-
-    AppState { queue }
-}
-
-fn create_queue(addr: &str) -> SharedQueue {
-    let queue = Queue::new(addr).unwrap();
-    return Arc::new(Mutex::new(queue));
+    queue: SharedPublisher,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -28,26 +24,97 @@ struct VotePayload {
     votee_id: String,
 }
 
+fn internal_server_error() -> HttpResponse {
+    HttpResponse::InternalServerError().body("An error occurred")
+}
+
+fn bad_request(message: &'static str) -> HttpResponse {
+    HttpResponse::BadRequest().body(message)
+}
+
+fn accepted(message: &'static str) -> HttpResponse {
+    HttpResponse::Accepted().body(message)
+}
+
 #[post("/vote")]
 async fn vote(app: web::Data<AppState>, payload: web::Json<VotePayload>) -> impl Responder {
-    let mut queue = app.queue.lock().unwrap();
+    match app.queue.lock() {
+        Err(err) => {
+            log::error!("Failed to lock queue: {:?}", err);
+            internal_server_error()
+        }
+        Ok(mut queue) => match serde_json::to_vec(&payload) {
+            Err(err) => {
+                log::error!("Failed to serialize vote payload {:?}", err);
+                bad_request("Failed to serialize vote payload")
+            }
+            Ok(payload) => match queue.publish(&payload).await {
+                Ok(_) => accepted("Vote received successfully"),
+                Err(err) => {
+                    log::error!("Failed to publish vote: {:?}", err);
+                    internal_server_error()
+                }
+            },
+        },
+    }
+}
 
-    let payload = serde_json::to_string(&payload).unwrap();
+type SharedPublisher = Arc<Mutex<Publisher>>;
 
-    queue.publish(payload.as_bytes());
+async fn queue_connect(addr: &str) -> Result<SharedPublisher, std::io::Error> {
+    let retries = 5;
+    let mut attempt = 0;
 
-    HttpResponse::Ok().body("Vote received")
+    while attempt < retries {
+        match QueueClient::connect(addr).await {
+            Ok(queue) => return Ok(Arc::new(Mutex::new(queue))),
+            Err(err) => {
+                log::error!("Failed to connect to queue at {}, error: {}", addr, err);
+                attempt += 1;
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    log::error!(
+        "Failed to connect to queue at {}, max retries of {} exceeded",
+        addr,
+        retries
+    );
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "Failed to connect to queue",
+    ))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    HttpServer::new(move || {
-        let app = create_app_state();
-        let app = web::Data::new(app);
+    env_logger::init();
 
-        App::new().app_data(app).service(vote)
+    let config = envy::from_env::<Config>().expect("Missing configuration");
+
+    log::info!("Starting server at {}:{}", config.api_host, config.api_port);
+
+    let queue_addr = format!("{}:{}", config.queue_host, config.queue_port);
+
+    HttpServer::new(move || {
+        let queue_addr = queue_addr.clone();
+
+        App::new()
+            .data_factory(move || {
+                let queue_addr = queue_addr.clone();
+
+                async move {
+                    let queue = queue_connect(&queue_addr).await?;
+
+                    Ok::<AppState, std::io::Error>(AppState { queue })
+                }
+            })
+            .service(vote)
     })
-    .bind(("127.0.0.1", 9000))?
+    .bind((config.api_host, config.api_port))?
     .run()
     .await
 }
